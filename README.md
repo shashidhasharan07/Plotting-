@@ -9,14 +9,29 @@ import atexit
 
 from PyQt5 import QtWidgets, QtCore
 import pyqtgraph as pg
+from itertools import islice
 
 
 # =====================================================
 # CONFIG
 # =====================================================
 
-GROUP = "239.1.1.1"
-PORT = 5005
+
+# One multicast group with two ports
+MULTICAST_GROUP = "239.1.1.1"
+
+MULTICAST_PORTS = [
+    5005,
+    5006
+]
+
+# One unicast IP with two ports
+UNICAST_IP = "0.0.0.0"
+
+UNICAST_PORTS = [
+    6000,
+    6001
+]
 
 HEADER_FMT = "!BBBBIQB3x"
 HEADER_SIZE = struct.calcsize(HEADER_FMT)
@@ -50,71 +65,58 @@ TARGET_COLORS = [
 
 ICD = {
 
-104: {
-    "type": "dynamic_array",
-    "count_fmt": "B",
-    "name" : "Target",
-    "element": {
-        "type": "mixed",
-        "blocks": [
-            {
-                "type": "struct",
-                "fmt": "!BH",
-                "fields": [
-                    ("id", None),
-                    ("range", 0.5),
-                ]
-            },
-            {
-                "type": "dynamic_array",
-                "count_fmt": "B",
-                "element": {
-                    "type": "struct",
-                    "fmt": "!fB",
-                    "fields": [
-                        ("velocity", 0.1),
-                        ("status", {
-                            "enum": {
-                                0: "FREE",
-                                1: "LOCKED"
-                            }
-                        })
-                    ]
-                }
-            }
-        ]
-    }
+# -------------------------------------------------
+# OPCODE 101
+# Multicast 239.1.1.1 : 5005
+# -------------------------------------------------
+
+101: {
+    "type": "struct",
+    "fmt": "!f",
+    "fields": [
+        ("sensor_101.value", None)
+    ]
 },
 
-105: {
-    "type": "mixed",
-    "blocks": [
-        {
-            "type": "struct",
-            "fmt": "!fff",
-            "fields": [
-                ("position.lat", None),
-                ("position.lon", None),
-                ("position.alt", None),
-            ]
-        },
-        {
-            "type": "struct",
-            "fmt": "!BH",
-            "fields": [
-                ("health.mode", {
-                    "enum": {
-                        0: "OFF",
-                        1: "STANDBY",
-                        2: "TRACK",
-                        3: "ENGAGE"
-                    }
-                }),
-                ("health.temperature", 0.1),
-            ]
-        }
+# -------------------------------------------------
+# OPCODE 102
+# Multicast 239.1.1.1 : 5006
+# -------------------------------------------------
+
+102: {
+    "type": "struct",
+    "fmt": "!f",
+    "fields": [
+        ("sensor_102.value", None)
+    ]
+},
+
+# -------------------------------------------------
+# OPCODE 103
+# Unicast 6000
+# -------------------------------------------------
+
+103: {
+    "type": "struct",
+    "fmt": "!f",
+    "fields": [
+        ("sensor_103.value", None)
+    ]
+},
+
+# -------------------------------------------------
+# OPCODE 104
+# Unicast 6001
+# -------------------------------------------------
+
+104: {
+    "type": "struct",
+    "fmt": "!f",
+    "fields": [
+        ("sensor_104.value", None)
     ]
 }
+
 }
 
 
@@ -201,10 +203,33 @@ class Store:
     def params(self, opcode):
         with self.lock:
             return sorted(self.data[opcode].keys())
+        
 
-    def series(self, opcode, param):
+    def series(self, opcode, param, window_left=None):
+
         with self.lock:
-            arr = list(self.data[opcode][param])
+            dq = self.data[opcode][param]
+
+            if not dq:
+                return [], []
+
+            if window_left is None:
+                arr = list(dq)
+
+            else:
+                # find first index inside window
+                start_idx = 0
+
+                for i, (t, _) in enumerate(dq):
+                    if t >= window_left:
+                        start_idx = i
+                        break
+                else:
+                    # nothing in window
+                    return [], []
+
+                # SAFE slicing for deque
+                arr = list(islice(dq, start_idx, None))
 
         if not arr:
             return [], []
@@ -232,12 +257,12 @@ store = Store()
 
 class TelemetryLogger:
 
-    def __init__(self):
+    def __init__(self, prefix="telemetry"):
 
         os.makedirs("logs", exist_ok=True)
 
         self.filename = time.strftime(
-            "logs/telemetry_%Y%m%d_%H%M%S.csv"
+             f"logs/{prefix}_%Y%m%d_%H%M%S.csv"
         )
 
         self.rows = []
@@ -287,8 +312,10 @@ class TelemetryLogger:
         print("Log saved successfully.")
 
 
-logger = TelemetryLogger()
-atexit.register(logger.close)
+logger_rx = TelemetryLogger(prefix="rx")
+logger_tx = TelemetryLogger(prefix="tx")
+atexit.register(logger_rx.close)
+atexit.register(logger_tx.close)
 
 
 # =====================================================
@@ -434,7 +461,7 @@ def decode_from_icd(opcode, payload):
 # RECEIVER
 # =====================================================
 
-def receiver():
+def receiver(group, port):
 
     sock = socket.socket(
         socket.AF_INET,
@@ -443,11 +470,11 @@ def receiver():
     )
 
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sock.bind(("", PORT))
+    sock.bind(("", port))
 
     mreq = struct.pack(
         "4sl",
-        socket.inet_aton(GROUP),
+        socket.inet_aton(group),
         socket.INADDR_ANY
     )
 
@@ -457,8 +484,7 @@ def receiver():
         mreq
     )
 
-    print("Listening multicast...")
-
+    print(f"Listening multicast {group}:{port}")
     while True:
 
         pkt, _ = sock.recvfrom(65535)
@@ -486,7 +512,82 @@ def receiver():
             continue
 
         store.add(opcode, decoded, ts, packet_no)
-        logger.log(packet_no, opcode, decoded, labels, ts)
+        logger_rx.log(packet_no, opcode, decoded, labels, ts)
+
+
+def unicast_receiver(ip, port):
+
+    sock = socket.socket(
+        socket.AF_INET,
+        socket.SOCK_DGRAM
+    )
+
+    sock.setsockopt(
+        socket.SOL_SOCKET,
+        socket.SO_REUSEADDR,
+        1
+    )
+
+    sock.bind((ip, port))
+
+    print(f"Listening UNICAST on {ip}:{port}")
+
+    while True:
+
+        pkt, _ = sock.recvfrom(65535)
+
+        if len(pkt) < HEADER_SIZE:
+            continue
+
+        header = struct.unpack(
+            HEADER_FMT,
+            pkt[:HEADER_SIZE]
+        )
+
+        packet_no = header[0]
+        opcode = header[1]
+        payload_len = header[4]
+        timestamp_us = header[5]
+
+        ts = timestamp_us / 1e6
+
+        payload = pkt[
+            HEADER_SIZE:
+            HEADER_SIZE + payload_len
+        ]
+
+        try:
+
+            decoded, labels = decode_from_icd(
+                opcode,
+                payload
+            )
+
+        except Exception as e:
+
+            print(
+                f"Decode error opcode {opcode}: {e}"
+            )
+
+            continue
+
+        # SAME STORE
+        store.add(
+            opcode,
+            decoded,
+            ts,
+            packet_no
+        )
+
+        # DIFFERENT LOG
+        logger_tx.log(
+            packet_no,
+            opcode,
+            decoded,
+            labels,
+            ts
+        )
+
 
 # =====================================================
 # UI
@@ -570,7 +671,7 @@ class PlotWindow(QtWidgets.QWidget):
 
         self.timer = QtCore.QTimer()
         self.timer.timeout.connect(self.update_plot)
-        self.timer.start(40)
+        self.timer.start(50)
 
         self.pause_btn.clicked.connect(self.toggle_pause)
         self.close_btn.clicked.connect(self.close_all)
@@ -590,15 +691,15 @@ class PlotWindow(QtWidgets.QWidget):
 
         plot.setClipToView(True)
         plot.setDownsampling(mode='peak')
-        plot.enableAutoRange(axis='y')
-        # Initialize X axis once
-        plot.setAutoVisible(x=True)
+        plot.enableAutoRange(axis='x', enable=False)
+        plot.enableAutoRange(axis='y', enable=True)
+
         plot.setAutoVisible(y=True)
 
-        plot.enableAutoRange(axis='x')
-        plot.enableAutoRange(axis='x', enable=False)
-
         curve = plot.plot()
+        plot.setMouseEnabled(x=False, y=True)
+        plot.setMenuEnabled(False)
+        plot.hideButtons()
 
         # --------------------------------
         # Controls
@@ -852,7 +953,9 @@ class PlotWindow(QtWidgets.QWidget):
                 packet_label.setText("Packet No: ---")
                 continue
 
-            x, y = store.series(op, param)
+            window_left = play_t - TIME_WINDOW - 1
+
+            x, y = store.series(op, param, window_left)
 
             if not y:
 
@@ -868,7 +971,14 @@ class PlotWindow(QtWidgets.QWidget):
 
             last_value = self.last_plotted_values[i]
 
+            window_left = play_t - TIME_WINDOW - 1
+
+
             for t, v in zip(x, y):
+
+                if t < window_left:
+                 continue
+
 
                 if t > play_t + 0.05:
                     continue
@@ -933,8 +1043,12 @@ class PlotWindow(QtWidgets.QWidget):
                 right = latest_time + RIGHT_MARGIN
                 left = right - TIME_WINDOW
 
-                plot.setXRange(left, right, padding=0.05)
-               
+                # Only update if changed
+                if not hasattr(plot, "_last_range") or plot._last_range != (left, right):
+
+                    plot.setXRange(left, right, padding=0)
+
+                    plot._last_range = (left, right)
             # Track last value for display
             current_value = fy[-1]
             self.last_plotted_values[i] = current_value
@@ -955,15 +1069,41 @@ class PlotWindow(QtWidgets.QWidget):
 
 def main():
 
-    threading.Thread(target=receiver, daemon=True).start()
+    # --------------------------------
+    # MULTICAST: 1 group, 2 ports
+    # --------------------------------
+
+    for port in MULTICAST_PORTS:
+
+        threading.Thread(
+            target=receiver,
+            args=(MULTICAST_GROUP, port),
+            daemon=True
+        ).start()
+
+    # --------------------------------
+    # UNICAST: 1 IP, 2 ports
+    # --------------------------------
+
+    for port in UNICAST_PORTS:
+
+        threading.Thread(
+            target=unicast_receiver,
+            args=(UNICAST_IP, port),
+            daemon=True
+        ).start()
+
+    # --------------------------------
+    # UI
+    # --------------------------------
 
     app = QtWidgets.QApplication([])
+
     win = PlotWindow()
-    win.resize(1400,700)
+    win.resize(1400, 700)
     win.show()
 
     app.exec_()
-
 
 if __name__ == "__main__":
     main()
